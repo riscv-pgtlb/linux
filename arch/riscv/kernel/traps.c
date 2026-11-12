@@ -129,9 +129,13 @@ void do_trap(struct pt_regs *regs, int signo, int code, unsigned long addr)
 	force_sig_fault(signo, code, (void __user *)addr);
 }
 
+extern bool pv_access_fixup(struct pt_regs *regs);
+
 static void do_trap_error(struct pt_regs *regs, int signo, int code,
 	unsigned long addr, const char *str)
 {
+	if (!user_mode(regs) && pv_access_fixup(regs))
+		return;
 	current->thread.bad_cause = regs->cause;
 
 	if (user_mode(regs)) {

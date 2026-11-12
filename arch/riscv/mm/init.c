@@ -30,6 +30,7 @@
 #include <asm/numa.h>
 #include <asm/pgtable.h>
 #include <asm/sections.h>
+#include <asm/sbi.h>
 #include <asm/soc.h>
 #include <asm/sparsemem.h>
 #include <asm/tlbflush.h>
@@ -797,12 +798,93 @@ static __meminit pgprot_t pgprot_from_va(uintptr_t va)
 	return PAGE_KERNEL;
 }
 
+extern void pv_access_before(void);
+extern void pv_access_after(void);
+
+
+static unsigned char pv_sbi_buffer[PAGE_SIZE] __aligned(PAGE_SIZE);
+
+static void pv_sbi_guard_test(const char *phase)
+{
+	static const struct {
+		unsigned long ext;
+		unsigned long func;
+		const char *name;
+	} tests[] = {
+		{ 0x4442434eUL, 1, "DBCN READ" },
+		{ 0x504d55UL, 0, "PMU" },
+		{ 0x44425452UL, ~0UL, "DBTR" },
+		{ 0x535345UL, ~0UL, "SSE" },
+		{ 0x4d505859UL, ~0UL, "MPXY" },
+		{ 0x48534dUL, 2, "HSM STATUS" },
+		{ 0x53555350UL, ~0UL, "SUSP" },
+		{ 0x46574654UL, ~0UL, "FWFT" },
+		{ 0x43505043UL, ~0UL, "CPPC" },
+	};
+	unsigned int index, byte;
+	struct sbiret result;
+
+	for (index = 0; index < ARRAY_SIZE(tests); index++) {
+		result = sbi_ecall(SBI_EXT_BASE, SBI_EXT_BASE_PROBE_EXT,
+				  tests[index].ext, 0, 0, 0, 0, 0);
+		if (result.error || result.value)
+			panic("PMP.Virt SBI probe FAIL %s %s error=%ld value=%ld",
+			      phase, tests[index].name,
+			      result.error, result.value);
+
+		for (byte = 0; byte < sizeof(pv_sbi_buffer); byte++)
+			pv_sbi_buffer[byte] = 0xa5;
+
+		if (tests[index].ext == 0x4442434eUL)
+			result = sbi_ecall(tests[index].ext, tests[index].func,
+					  sizeof(pv_sbi_buffer),
+					  __pa_symbol(pv_sbi_buffer),
+					  0, 0, 0, 0);
+		else
+			result = sbi_ecall(tests[index].ext, tests[index].func,
+					  0, 0, 0, 0, 0, 0);
+
+		if (result.error != SBI_ERR_NOT_SUPPORTED)
+			panic("PMP.Virt SBI direct FAIL %s %s error=%ld",
+			      phase, tests[index].name, result.error);
+
+		for (byte = 0; byte < sizeof(pv_sbi_buffer); byte++)
+			if (READ_ONCE(pv_sbi_buffer[byte]) != 0xa5)
+				panic("PMP.Virt SBI buffer changed %s %s",
+				      phase, tests[index].name);
+
+		pr_info("PMP.Virt SBI GUARD PASS %s %s probe=0 error=%ld buffer=unchanged\n",
+			phase, tests[index].name, result.error);
+	}
+}
+
 void mark_rodata_ro(void)
 {
 	set_kernel_memory(__start_rodata, _data, set_memory_ro);
 	if (IS_ENABLED(CONFIG_64BIT))
 		set_kernel_memory(lm_alias(__start_rodata), lm_alias(_data),
 				  set_memory_ro);
+
+	/* Experimental single-hart static kernel: no layout supplied by S. */
+	{
+		struct sbiret ret;
+		phys_addr_t ts = __pa_symbol(_text);
+		phys_addr_t te = __pa_symbol(_etext);
+		phys_addr_t rs = __pa_symbol(__start_rodata);
+		phys_addr_t re = __pa_symbol(_data);
+
+		pr_info("PMP.Virt request: text=[%pa,%pa) rodata=[%pa,%pa)\n",
+			&ts, &te, &rs, &re);
+		pv_sbi_guard_test("before seal");
+		pv_access_before();
+		ret = sbi_ecall(0x0a000056, 0, 0, 0, 0, 0, 0, 0);
+		if (ret.error || ret.value != 1)
+			panic("PMP.Virt seal failed: error=%ld value=%ld",
+			      ret.error, ret.value);
+		pr_info("PMP.Virt seal acknowledged\n");
+		pv_access_after();
+		pv_sbi_guard_test("after seal");
+	}
 }
 #else
 static __meminit pgprot_t pgprot_from_va(uintptr_t va)
