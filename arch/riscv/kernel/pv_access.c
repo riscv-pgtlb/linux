@@ -208,8 +208,10 @@ static int pv_check_write_alias(pte_t *pte, unsigned long address, void *data)
 static long pv_syscall_ioctl(unsigned long arg)
 {
     struct pv_syscall_request result = {.version = 1, .count = 4};
-    struct page *text_page, *ro_page;
-    void *data = NULL, *code = NULL, *text = NULL, *ro = NULL, *old_alias;
+    struct page *text_page, *ro_page, *code_page;
+    void *data = NULL, *code = NULL, *exec = NULL;
+    void *text = NULL, *ro = NULL, *old_alias;
+    pgprot_t prot;
     unsigned initial_failures;
     long rc;
 
@@ -247,22 +249,31 @@ static long pv_syscall_ioctl(unsigned long arg)
                             pv_check_write_alias, ro_page);
     if (rc)
         goto cleanup;
-    rc = set_memory_ro((unsigned long)code, 1);
+    /* Only change the temporary alias. set_memory_ro/x also changes the
+     * linear mapping, which must remain RW/NX when the page is freed.
+     */
+    code_page = vmalloc_to_page(code);
+    prot = __pgprot((pgprot_val(PAGE_KERNEL) | _PAGE_EXEC) & ~_PAGE_WRITE);
+    exec = vmap(&code_page, 1, VM_MAP, prot);
+    if (!exec) {
+        rc = -ENOMEM;
+        goto cleanup;
+    }
+    rc = apply_to_page_range(&init_mm, (unsigned long)exec, PAGE_SIZE,
+                            pv_enable_alias_exec, code_page);
     if (rc)
         goto cleanup;
-    rc = set_memory_x((unsigned long)code, 1);
-    if (rc)
-        goto cleanup;
-    rc = apply_to_page_range(&init_mm, (unsigned long)code, PAGE_SIZE,
+    flush_tlb_all();
+    rc = apply_to_page_range(&init_mm, (unsigned long)exec, PAGE_SIZE,
                             pv_check_pte, NULL);
     if (rc)
         goto cleanup;
-    flush_icache_range((unsigned long)code, (unsigned long)code + 8);
+    flush_icache_range((unsigned long)exec, (unsigned long)exec + 8);
     initial_failures = failures;
     old_alias = code_alias;
-    code_alias = code;
+    code_alias = exec;
     result.results[0] = probe("syscall ordinary data store control", data, false, 0);
-    result.results[1] = probe("syscall HS RAM RX/U0 execute", code, true, 1);
+    result.results[1] = probe("syscall HS RAM RX/U0 execute", exec, true, 1);
     result.results[2] = probe("syscall text writable alias", text, false, 7);
     result.results[3] = probe("syscall rodata writable alias", ro, false, 7);
     code_alias = old_alias;
@@ -270,11 +281,12 @@ static long pv_syscall_ioctl(unsigned long arg)
     if (copy_to_user((void __user *)arg, &result, sizeof(result)))
         rc = -EFAULT;
 cleanup:
+    if (exec)
+        vunmap(exec);
     if (ro)
         vunmap(ro);
     if (text)
         vunmap(text);
-    /* vfree tears down the temporary executable mapping as well. */
     vfree(code);
     vfree(data);
     mutex_unlock(&pv_user_lock);
