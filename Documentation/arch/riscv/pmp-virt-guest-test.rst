@@ -48,3 +48,14 @@ page migration/reuse, not all possible mapping changes or writes.
 The SDK regression/parser and source version locks have not yet been updated
 to enable this experiment. Object compilation alone does not prove that the
 three phases run correctly under KVM.
+
+Executable alias setup
+----------------------
+
+Generic vmap strips executable permission using pgprot_nx even if the caller
+supplies PAGE_KERNEL_READ_EXEC. The probe explicitly walks its own alias PTE,
+checks that it maps the dedicated page with R/U0/no-W, sets EXEC, flushes the
+kernel TLB range and then walks it again to require RX/U0 on the same page.
+Only after that verification does it execute the instructions. Passing an RX
+protection to vmap alone caused the first real guest run to fault with cause
+12 (instruction page fault), before the host comparison was reached.

@@ -9,6 +9,7 @@
 #include <asm/cacheflush.h>
 #include <asm/pgtable.h>
 #include <asm/sbi.h>
+#include <asm/tlbflush.h>
 
 #define PV_TEST_EXT 0x08000057
 #define PV_TEST_BEGIN 0
@@ -28,6 +29,35 @@ static int __init pv_guest_test_setup(char *value)
 	return 0;
 }
 early_param("pmpvirt_guest_test", pv_guest_test_setup);
+
+/* vmap() deliberately strips EXEC via pgprot_nx(), even for an RX prot. */
+static int pv_guest_set_exec(pte_t *pte, unsigned long address, void *data)
+{
+	struct page *page = data;
+	pte_t entry = ptep_get(pte);
+	unsigned long flags = pte_val(entry);
+
+	if ((flags & (_PAGE_PRESENT | _PAGE_READ)) !=
+	    (_PAGE_PRESENT | _PAGE_READ) ||
+	    (flags & (_PAGE_USER | _PAGE_WRITE)) ||
+	    pte_pfn(entry) != page_to_pfn(page))
+		return -EINVAL;
+	set_pte_at(&init_mm, address, pte, __pte(flags | _PAGE_EXEC));
+	return 0;
+}
+
+static int pv_guest_check_exec(pte_t *pte, unsigned long address, void *data)
+{
+	struct page *page = data;
+	unsigned long flags = pte_val(ptep_get(pte));
+	unsigned long required = _PAGE_PRESENT | _PAGE_READ | _PAGE_EXEC;
+
+	if ((flags & required) != required ||
+	    (flags & (_PAGE_USER | _PAGE_WRITE)) ||
+	    pte_pfn(ptep_get(pte)) != page_to_pfn(page))
+		return -EINVAL;
+	return 0;
+}
 
 static int __init pv_guest_test_init(void)
 {
@@ -67,6 +97,22 @@ static int __init pv_guest_test_init(void)
 		return -ENOMEM;
 	}
 
+	rc = apply_to_page_range(&init_mm, (unsigned long)pv_guest_test_exec,
+				 PAGE_SIZE, pv_guest_set_exec, pv_guest_test_page);
+	if (rc) {
+		pr_err("PMP.Virt VS-HS-VS FAIL: set executable alias error=%d\n", rc);
+		goto cleanup;
+	}
+	flush_tlb_kernel_range((unsigned long)pv_guest_test_exec,
+			       (unsigned long)pv_guest_test_exec + PAGE_SIZE);
+	rc = apply_to_page_range(&init_mm, (unsigned long)pv_guest_test_exec,
+				 PAGE_SIZE, pv_guest_check_exec, pv_guest_test_page);
+	if (rc) {
+		pr_err("PMP.Virt VS-HS-VS FAIL: verify executable alias error=%d\n", rc);
+		goto cleanup;
+	}
+	pr_info("PMP.Virt VS EXEC MAP VERIFIED: RX/U0 same-page\n");
+
 	gpa = page_to_phys(pv_guest_test_page);
 	/* In a guest, page_to_phys yields GPA, not the host physical address. */
 	pr_info("PMP.Virt GUEST PROBE PAGE: GPA=%pa size=%lu code_bytes=%zu\n",
@@ -99,6 +145,7 @@ static int __init pv_guest_test_init(void)
 			   (unsigned long)pv_guest_test_exec + sizeof(code));
 	result = execute();
 	if (result != 42) {
+		rc = -EINVAL;
 		pr_err("PMP.Virt VS-HS-VS FAIL: second result=%lu\n", result);
 		sbi_ecall(PV_TEST_EXT, PV_TEST_ABORT, 0, 0, 0, 0, 0, 0);
 		goto cleanup;
