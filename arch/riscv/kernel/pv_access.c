@@ -1,4 +1,4 @@
-/* Boot-only destructive-access controls. Store the original byte unchanged. */
+/* Fixed-target boot/syscall access controls. Store the original byte unchanged. */
 #include <linux/mm.h>
 #include <linux/sched.h>
 #include <linux/vmalloc.h>
@@ -24,6 +24,12 @@ static unsigned long wanted_pc, wanted_addr, recovery_pc;
 static unsigned long observed_cause, observed_pc, observed_addr;
 static unsigned failures, observations;
 
+struct pv_access_result {
+    __u64 cause;
+    __u64 before;
+    __u64 after;
+};
+
 /* Called only for kernel-mode synchronous access errors/page faults.
  * A matching task, exact faulting PC, exact address, and class are mandatory.
  * This is temporary test instrumentation, never part of production policy.
@@ -47,10 +53,12 @@ bool pv_access_fixup(struct pt_regs *regs)
     return true;
 }
 
-static void probe(const char *name, void *addr, bool execute, unsigned expected)
+static struct pv_access_result probe(const char *name, void *addr,
+                                    bool execute, unsigned expected)
 {
     unsigned long flags, value = 0;
     unsigned char original = READ_ONCE(*(unsigned char *)addr);
+    struct pv_access_result result;
     owner = current;
     wanted_addr = (unsigned long)addr;
     wanted_pc = execute ? wanted_addr : (unsigned long)pv_test_store_insn;
@@ -67,10 +75,13 @@ static void probe(const char *name, void *addr, bool execute, unsigned expected)
     barrier();
     WRITE_ONCE(armed, false);
     local_irq_restore(flags);
+    result.cause = observed_cause;
+    result.before = original;
+    result.after = READ_ONCE(*(unsigned char *)addr);
     observations++;
     if (observed_cause != expected ||
         (!expected && execute && value != 42) ||
-        READ_ONCE(*(unsigned char *)addr) != original) {
+        result.after != original) {
         failures++;
         pr_err("PMP.Virt TEST FAIL %s cause=%lu expected=%u pc=%lx tval=%lx value=%lu\n",
                name, observed_cause, expected, observed_pc, observed_addr, value);
@@ -78,6 +89,7 @@ static void probe(const char *name, void *addr, bool execute, unsigned expected)
         pr_info("PMP.Virt TEST PASS %s cause=%lu pc=%lx tval=%lx\n",
                 name, observed_cause, observed_pc, observed_addr);
     }
+    return result;
 }
 
 void pv_access_before(void)
@@ -141,6 +153,13 @@ struct pv_user_request {
     __u64 cause;
 };
 #define PV_USER_PROBE _IOWR('V', 0x56, struct pv_user_request)
+/* Output only: callers cannot select an address, instruction, or write value. */
+struct pv_syscall_request {
+    __u64 version;
+    __u64 count;
+    struct pv_access_result results[4];
+};
+#define PV_SYSCALL_PROBE _IOR('V', 0x58, struct pv_syscall_request)
 static DEFINE_MUTEX(pv_user_lock);
 
 #include <asm/tlbflush.h>
@@ -172,6 +191,108 @@ static int pv_check_pte(pte_t *pte, unsigned long address, void *data)
     if ((flags & required) != required || (flags & (_PAGE_USER | _PAGE_WRITE)))
         { pr_err("PMP.Virt USER EINVAL line=%d\n", __LINE__); return -EINVAL; }
     return 0;
+}
+
+static int pv_check_write_alias(pte_t *pte, unsigned long address, void *data)
+{
+    pte_t entry = ptep_get(pte);
+    unsigned long flags = pte_val(entry);
+    unsigned long required = _PAGE_PRESENT | _PAGE_READ | _PAGE_WRITE;
+    struct page *page = data;
+
+    (void)address;
+    if ((flags & required) != required || (flags & (_PAGE_USER | _PAGE_EXEC)) ||
+        pte_pfn(entry) != page_to_pfn(page))
+        return -EINVAL;
+    return 0;
+}
+
+static long pv_syscall_ioctl(unsigned long arg)
+{
+    struct pv_syscall_request result = {.version = 1, .count = 4};
+    struct page *text_page, *ro_page, *code_page;
+    void *data = NULL, *code = NULL, *exec = NULL;
+    void *text = NULL, *ro = NULL, *old_alias;
+    pgprot_t prot;
+    unsigned initial_failures;
+    long rc;
+
+    if (!capable(CAP_SYS_ADMIN))
+        return -EPERM;
+    if (!READ_ONCE(pv_boot_tests_done) || num_online_cpus() != 1)
+        return -EBUSY;
+    if (!arg || !access_ok((void __user *)arg, sizeof(result)))
+        return -EFAULT;
+    if (mutex_lock_interruptible(&pv_user_lock))
+        return -EINTR;
+
+    /* All targets are fixed by the kernel and all mappings are temporary.
+     * Writable aliases bypass S-stage read-only PTEs, so cause 7 (not 15)
+     * establishes that PMP denied the stores. Same-byte stores cannot patch
+     * live code or read-only data even if the protection regresses.
+     */
+    data = vmalloc(PAGE_SIZE);
+    code = vmalloc(PAGE_SIZE);
+    text_page = pfn_to_page(__pa_symbol(_text) >> PAGE_SHIFT);
+    ro_page = pfn_to_page(__pa_symbol(__start_rodata) >> PAGE_SHIFT);
+    text = vmap(&text_page, 1, VM_MAP, PAGE_KERNEL);
+    ro = vmap(&ro_page, 1, VM_MAP, PAGE_KERNEL);
+    rc = -ENOMEM;
+    if (!data || !code || !text || !ro)
+        goto cleanup;
+    *(unsigned char *)data = 0x5a;
+    ((u32 *)code)[0] = 0x02a00513;
+    ((u32 *)code)[1] = 0x00008067;
+    rc = apply_to_page_range(&init_mm, (unsigned long)text, PAGE_SIZE,
+                            pv_check_write_alias, text_page);
+    if (rc)
+        goto cleanup;
+    rc = apply_to_page_range(&init_mm, (unsigned long)ro, PAGE_SIZE,
+                            pv_check_write_alias, ro_page);
+    if (rc)
+        goto cleanup;
+    /* Only change the temporary alias. set_memory_ro/x also changes the
+     * linear mapping, which must remain RW/NX when the page is freed.
+     */
+    code_page = vmalloc_to_page(code);
+    prot = __pgprot((pgprot_val(PAGE_KERNEL) | _PAGE_EXEC) & ~_PAGE_WRITE);
+    exec = vmap(&code_page, 1, VM_MAP, prot);
+    if (!exec) {
+        rc = -ENOMEM;
+        goto cleanup;
+    }
+    rc = apply_to_page_range(&init_mm, (unsigned long)exec, PAGE_SIZE,
+                            pv_enable_alias_exec, code_page);
+    if (rc)
+        goto cleanup;
+    flush_tlb_all();
+    rc = apply_to_page_range(&init_mm, (unsigned long)exec, PAGE_SIZE,
+                            pv_check_pte, NULL);
+    if (rc)
+        goto cleanup;
+    flush_icache_range((unsigned long)exec, (unsigned long)exec + 8);
+    initial_failures = failures;
+    old_alias = code_alias;
+    code_alias = exec;
+    result.results[0] = probe("syscall ordinary data store control", data, false, 0);
+    result.results[1] = probe("syscall HS RAM RX/U0 execute", exec, true, 1);
+    result.results[2] = probe("syscall text writable alias", text, false, 7);
+    result.results[3] = probe("syscall rodata writable alias", ro, false, 7);
+    code_alias = old_alias;
+    rc = failures == initial_failures ? 0 : -EIO;
+    if (copy_to_user((void __user *)arg, &result, sizeof(result)))
+        rc = -EFAULT;
+cleanup:
+    if (exec)
+        vunmap(exec);
+    if (ro)
+        vunmap(ro);
+    if (text)
+        vunmap(text);
+    vfree(code);
+    vfree(data);
+    mutex_unlock(&pv_user_lock);
+    return rc;
 }
 
 /* VS/HS protocol: pin one guest backing page until completion or close. */
@@ -340,6 +461,8 @@ static long pv_user_ioctl(struct file *file, unsigned int cmd, unsigned long arg
     (void)file;
     if (cmd == PV_GUEST_PROBE)
         return pv_guest_ioctl(file, arg);
+    if (cmd == PV_SYSCALL_PROBE)
+        return pv_syscall_ioctl(arg);
     if (cmd != PV_USER_PROBE)
         return -ENOTTY;
     if (!capable(CAP_SYS_ADMIN))
