@@ -1,1 +1,12 @@
 source "arch/riscv/kernel/tests/Kconfig.debug"
+
+config RISCV_PMP_VIRT_GUEST_TEST
+	bool "PMP.Virt guest kernel execution probe"
+	depends on 64BIT && MMU && RISCV_SBI && !CFI_CLANG
+	default n
+	help
+	  Build the cooperative VS/HS same-page execution test. Activate it
+	  with pmpvirt_guest_test=1 under lkvm --pmp-virt-test with one vCPU.
+	  Requires the paired experimental host /dev/pvtest ioctl. Executes
+	  fixed instructions before and after a synchronous host HS probe.
+	  Say N for normal use.
