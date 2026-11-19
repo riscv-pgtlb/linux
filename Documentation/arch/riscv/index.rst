@@ -14,6 +14,7 @@ RISC-V architecture
     uabi
     vector
     cmodx
+    pmp-virt-host-test
 
     features
 

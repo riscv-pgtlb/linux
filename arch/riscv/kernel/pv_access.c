@@ -130,6 +130,8 @@ void pv_access_after(void)
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/uaccess.h>
+#include <linux/slab.h>
+#include <linux/sched/mm.h>
 #include <asm/processor.h>
 #include <asm/pgtable.h>
 
@@ -172,6 +174,159 @@ static int pv_check_pte(pte_t *pte, unsigned long address, void *data)
     return 0;
 }
 
+/* VS/HS protocol: pin one guest backing page until completion or close. */
+struct pv_guest_request {
+    __u64 operation;
+    __u64 address;
+    __u64 physical;
+    __u64 cause;
+};
+#define PV_GUEST_PROBE _IOWR('V', 0x57, struct pv_guest_request)
+#define PV_GUEST_BEGIN 0
+#define PV_GUEST_COMPLETE 1
+
+struct pv_guest_session {
+    struct page *page;
+    struct mm_struct *mm;
+    unsigned long address;
+};
+
+static void pv_guest_drop(struct pv_guest_session *session)
+{
+    if (session->page)
+        unpin_user_page(session->page);
+    if (session->mm)
+        mmput(session->mm);
+    session->page = NULL;
+    session->mm = NULL;
+}
+
+static int pv_probe_open(struct inode *inode, struct file *file)
+{
+    file->private_data = kzalloc(sizeof(struct pv_guest_session), GFP_KERNEL);
+    return file->private_data ? 0 : -ENOMEM;
+}
+
+static int pv_probe_release(struct inode *inode, struct file *file)
+{
+    struct pv_guest_session *session = file->private_data;
+
+    mutex_lock(&pv_user_lock);
+    pv_guest_drop(session);
+    mutex_unlock(&pv_user_lock);
+    kfree(session);
+    return 0;
+}
+
+static long pv_guest_ioctl(struct file *file, unsigned long arg)
+{
+    static const __le32 payload[] = {
+        cpu_to_le32(0x02a00513), cpu_to_le32(0x00008067),
+    };
+    struct pv_guest_session *session = file->private_data;
+    struct pv_guest_request req;
+    struct vm_area_struct *vma;
+    struct page *page = NULL;
+    void *alias = NULL, *old_alias;
+    unsigned initial_failures;
+    long rc;
+
+    if (!capable(CAP_SYS_ADMIN))
+        return -EPERM;
+    if (!READ_ONCE(pv_boot_tests_done) || num_online_cpus() != 1)
+        return -EBUSY;
+    if (copy_from_user(&req, (void __user *)arg, sizeof(req)))
+        return -EFAULT;
+    if (PAGE_SIZE != 4096 || req.operation > PV_GUEST_COMPLETE ||
+        !req.address || (req.address & (PAGE_SIZE - 1)) ||
+        req.address > TASK_SIZE - PAGE_SIZE || req.cause)
+        return -EINVAL;
+    if (mutex_lock_interruptible(&pv_user_lock))
+        return -EINTR;
+    if ((req.operation == PV_GUEST_BEGIN &&
+         (session->page || req.physical)) ||
+        (req.operation == PV_GUEST_COMPLETE &&
+         (!session->page || session->mm != current->mm ||
+          session->address != req.address ||
+          page_to_phys(session->page) != req.physical))) {
+        rc = -EINVAL;
+        goto unlock;
+    }
+    mmap_read_lock(current->mm);
+    vma = vma_lookup(current->mm, req.address);
+    /* KVM anonymous RAM is writable, unlike the existing HU RX mapping. */
+    if (!vma || vma->vm_end - req.address < PAGE_SIZE ||
+        (vma->vm_flags & (VM_READ | VM_WRITE)) != (VM_READ | VM_WRITE) ||
+        (vma->vm_flags & (VM_IO | VM_PFNMAP | VM_MIXEDMAP)) ||
+        !vma_is_anonymous(vma)) {
+        rc = -EINVAL;
+        goto unlock_mm;
+    }
+    rc = pin_user_pages(req.address, 1, FOLL_WRITE | FOLL_LONGTERM, &page);
+    if (rc != 1) {
+        rc = rc < 0 ? rc : -EFAULT;
+        page = NULL;
+        goto unlock_mm;
+    }
+    if (req.operation == PV_GUEST_COMPLETE && page != session->page) {
+        rc = -ESTALE;
+        goto unlock_mm;
+    }
+    alias = vmap(&page, 1, VM_MAP, PAGE_KERNEL_READ_EXEC);
+    if (!alias) {
+        rc = -ENOMEM;
+        goto unlock_mm;
+    }
+    if (memcmp(alias, payload, sizeof(payload))) {
+        rc = -EINVAL;
+        goto unlock_mm;
+    }
+    rc = apply_to_page_range(&init_mm, (unsigned long)alias, PAGE_SIZE,
+                            pv_enable_alias_exec, page);
+    if (rc)
+        goto unlock_mm;
+    flush_tlb_all();
+    rc = apply_to_page_range(&init_mm, (unsigned long)alias, PAGE_SIZE,
+                            pv_check_pte, NULL);
+    if (rc)
+        goto unlock_mm;
+    req.physical = page_to_phys(page);
+    flush_icache_range((unsigned long)alias, (unsigned long)alias + sizeof(payload));
+    old_alias = code_alias;
+    code_alias = alias;
+    initial_failures = failures;
+    probe(req.operation == PV_GUEST_BEGIN ? "guest BEGIN same-page HS RX/U0 execute" :
+          "guest COMPLETE same-page HS RX/U0 execute", alias, true, 1);
+    req.cause = observed_cause;
+    code_alias = old_alias;
+    rc = failures == initial_failures && req.cause == 1 ? 0 : -EIO;
+    if (rc)
+        goto unlock_mm;
+    if (copy_to_user((void __user *)arg, &req, sizeof(req))) {
+        rc = -EFAULT;
+        goto unlock_mm;
+    }
+    if (req.operation == PV_GUEST_BEGIN) {
+        session->mm = get_task_mm(current);
+        session->address = req.address;
+        session->page = page;
+        page = NULL; /* Retain this pin across the guest's second execution. */
+    }
+    pr_info("PMP.Virt GUEST HOST CHECK: phase=%llu HPA=%llx cause=%llu\n",
+            req.operation, req.physical, req.cause);
+unlock_mm:
+    if (alias)
+        vunmap(alias);
+    if (page)
+        unpin_user_page(page);
+    mmap_read_unlock(current->mm);
+    if (req.operation == PV_GUEST_COMPLETE)
+        pv_guest_drop(session);
+unlock:
+    mutex_unlock(&pv_user_lock);
+    return rc;
+}
+
 static long pv_user_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
     struct pv_user_request req;
@@ -183,6 +338,8 @@ static long pv_user_ioctl(struct file *file, unsigned int cmd, unsigned long arg
     unsigned initial_failures;
     const u32 payload[2] = {0x02a00513, 0x00008067};
     (void)file;
+    if (cmd == PV_GUEST_PROBE)
+        return pv_guest_ioctl(file, arg);
     if (cmd != PV_USER_PROBE)
         return -ENOTTY;
     if (!capable(CAP_SYS_ADMIN))
@@ -260,6 +417,8 @@ unlock_mm:
 
 static const struct file_operations pv_user_ops = {
     .owner = THIS_MODULE,
+    .open = pv_probe_open,
+    .release = pv_probe_release,
     .unlocked_ioctl = pv_user_ioctl,
 };
 static struct miscdevice pv_user_device = {
