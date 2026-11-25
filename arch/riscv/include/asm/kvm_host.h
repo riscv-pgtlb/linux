@@ -83,6 +83,12 @@ struct kvm_vcpu_stat {
 struct kvm_arch_memory_slot {
 };
 
+struct kvm_riscv_stage2_virt_state {
+	gpa_t start;
+	gpa_t end;
+	bool enabled;
+};
+
 struct kvm_arch {
 	/* G-stage vmid */
 	struct kvm_vmid vmid;
@@ -90,6 +96,12 @@ struct kvm_arch {
 	/* G-stage page table */
 	pgd_t *pgd;
 	phys_addr_t pgd_phys;
+
+	/*
+	 * Local experimental Stage2Virt GPA range.
+	 * Protected by kvm->mmu_lock.
+	 */
+	struct kvm_riscv_stage2_virt_state stage2_virt;
 
 	/* Guest Timer */
 	struct kvm_guest_timer timer;

@@ -962,6 +962,7 @@ struct kvm_enable_cap {
 #define KVM_CAP_ARM_EL2_E2H0 241
 #define KVM_CAP_RISCV_MP_STATE_RESET 242
 #define KVM_CAP_ARM_CACHEABLE_PFNMAP_SUPPORTED 243
+#define KVM_CAP_RISCV_STAGE2_VIRT 244
 
 struct kvm_irq_routing_irqchip {
 	__u32 irqchip;
@@ -1292,6 +1293,7 @@ struct kvm_vfio_spapr_tce {
 #define KVM_ARM_SET_COUNTER_OFFSET _IOW(KVMIO,  0xb5, struct kvm_arm_counter_offset)
 #define KVM_ARM_GET_REG_WRITABLE_MASKS _IOR(KVMIO,  0xb6, struct reg_mask_range)
 
+#define KVM_RISCV_SET_STAGE2_VIRT _IOW(KVMIO, 0xb8, struct kvm_riscv_stage2_virt)
 /* ioctl for vm fd */
 #define KVM_CREATE_DEVICE	  _IOWR(KVMIO,  0xe0, struct kvm_create_device)
 

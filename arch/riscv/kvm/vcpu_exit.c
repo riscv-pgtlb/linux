@@ -12,6 +12,67 @@
 #include <asm/kvm_mmu.h>
 #include <asm/kvm_nacl.h>
 
+static bool stage2_virt_fault(struct kvm_vcpu *vcpu,
+			      unsigned long fault_addr,
+			      unsigned long scause)
+{
+	struct kvm *kvm = vcpu->kvm;
+	struct kvm_riscv_stage2_virt_state *state;
+	struct kvm_gstage gstage;
+	pte_t *ptep;
+	u32 ptep_level;
+	bool found;
+	bool stage2_virt = false;
+
+	if (scause != EXC_INST_GUEST_PAGE_FAULT &&
+	    scause != EXC_STORE_GUEST_PAGE_FAULT)
+		return false;
+
+	gstage.kvm = kvm;
+	gstage.flags = 0;
+	gstage.vmid = READ_ONCE(kvm->arch.vmid.vmid);
+	gstage.pgd = kvm->arch.pgd;
+
+	spin_lock(&kvm->mmu_lock);
+
+	state = &kvm->arch.stage2_virt;
+
+	if (!state->enabled ||
+	    fault_addr < state->start ||
+	    fault_addr >= state->end)
+		goto out;
+
+	found = kvm_riscv_gstage_get_leaf(&gstage, fault_addr,
+					  &ptep, &ptep_level);
+	if (!found)
+		goto out;
+
+	stage2_virt =
+		gstage_pte_stage2_virt(ptep_get(ptep));
+
+out:
+	spin_unlock(&kvm->mmu_lock);
+
+	return stage2_virt;
+}
+static int stage2_virt_redirect_fault(struct kvm_vcpu *vcpu,
+				      struct kvm_cpu_trap *trap)
+{
+	switch (trap->scause) {
+	case EXC_INST_GUEST_PAGE_FAULT:
+		trap->scause = EXC_INST_PAGE_FAULT;
+		break;
+	case EXC_STORE_GUEST_PAGE_FAULT:
+		trap->scause = EXC_STORE_PAGE_FAULT;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	kvm_riscv_vcpu_trap_redirect(vcpu, trap);
+
+	return 1;
+}
 static int gstage_page_fault(struct kvm_vcpu *vcpu, struct kvm_run *run,
 			     struct kvm_cpu_trap *trap)
 {
@@ -23,6 +84,8 @@ static int gstage_page_fault(struct kvm_vcpu *vcpu, struct kvm_run *run,
 	int ret;
 
 	fault_addr = (trap->htval << 2) | (trap->stval & 0x3);
+	if (stage2_virt_fault(vcpu, fault_addr, trap->scause))
+		return stage2_virt_redirect_fault(vcpu, trap);
 	gfn = fault_addr >> PAGE_SHIFT;
 	memslot = gfn_to_memslot(vcpu->kvm, gfn);
 	hva = gfn_to_hva_memslot_prot(memslot, gfn, &writable);

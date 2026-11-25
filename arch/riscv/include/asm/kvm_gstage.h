@@ -23,6 +23,18 @@ struct kvm_gstage_mapping {
 	u32 level;
 };
 
+// 识别、设置和清除 _PAGE_STAGE2_VIRT
+#define _PAGE_STAGE2_VIRT	_PAGE_SPECIAL
+static inline bool gstage_pte_stage2_virt(pte_t pte) {
+	return pte_val(pte) & _PAGE_STAGE2_VIRT;
+}
+static inline pte_t gstage_pte_mkstage2_virt(pte_t pte) {
+	return __pte(pte_val(pte) | _PAGE_STAGE2_VIRT);
+}
+static inline pte_t gstage_pte_clear_stage2_virt(pte_t pte) {
+	return __pte(pte_val(pte) & ~_PAGE_STAGE2_VIRT);
+}
+
 #ifdef CONFIG_64BIT
 #define kvm_riscv_gstage_index_bits	9
 #else
@@ -51,6 +63,7 @@ int kvm_riscv_gstage_map_page(struct kvm_gstage *gstage,
 			      struct kvm_mmu_memory_cache *pcache,
 			      gpa_t gpa, phys_addr_t hpa, unsigned long page_size,
 			      bool page_rdonly, bool page_exec,
+				  bool stage2_virt,
 			      struct kvm_gstage_mapping *out_map);
 
 enum kvm_riscv_gstage_op {
@@ -64,6 +77,9 @@ void kvm_riscv_gstage_op_pte(struct kvm_gstage *gstage, gpa_t addr,
 
 void kvm_riscv_gstage_unmap_range(struct kvm_gstage *gstage,
 				  gpa_t start, gpa_t size, bool may_block);
+
+void kvm_riscv_gstage_zap_range(struct kvm_gstage *gstage,
+					gpa_t start, gpa_t size, bool may_block);
 
 void kvm_riscv_gstage_wp_range(struct kvm_gstage *gstage, gpa_t start, gpa_t end);
 

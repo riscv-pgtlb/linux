@@ -170,6 +170,7 @@ int kvm_arch_prepare_memory_region(struct kvm *kvm,
 				struct kvm_memory_slot *new,
 				enum kvm_mr_change change)
 {
+	struct kvm_riscv_stage2_virt_state stage2_state;
 	hva_t hva, reg_end, size;
 	gpa_t base_gpa;
 	bool writable;
@@ -192,6 +193,17 @@ int kvm_arch_prepare_memory_region(struct kvm *kvm,
 	reg_end = hva + size;
 	base_gpa = new->base_gfn << PAGE_SHIFT;
 	writable = !(new->flags & KVM_MEM_READONLY);
+
+	if (new->flags & KVM_MEM_LOG_DIRTY_PAGES) {
+		spin_lock(&kvm->mmu_lock);
+		stage2_state = kvm->arch.stage2_virt;
+		spin_unlock(&kvm->mmu_lock);
+
+		if (stage2_state.enabled &&
+		    base_gpa < stage2_state.end &&
+		    stage2_state.start < base_gpa + size)
+			return -EBUSY;
+	}
 
 	mmap_read_lock(current->mm);
 
@@ -322,6 +334,26 @@ bool kvm_test_age_gfn(struct kvm *kvm, struct kvm_gfn_range *range)
 
 	return pte_young(ptep_get(ptep));
 }
+enum kvm_riscv_stage2_virt_match {
+	KVM_RISCV_STAGE2_VIRT_NONE,
+	KVM_RISCV_STAGE2_VIRT_FULL,
+	KVM_RISCV_STAGE2_VIRT_PARTIAL,
+};
+
+static enum kvm_riscv_stage2_virt_match
+kvm_riscv_stage2_virt_match(
+	const struct kvm_riscv_stage2_virt_state *state,
+	gpa_t map_start, unsigned long map_size)
+{
+	gpa_t map_end = map_start + map_size;
+	if (!state->enabled)
+		return KVM_RISCV_STAGE2_VIRT_NONE;
+	if (map_end <= state->start || map_start >= state->end)
+		return KVM_RISCV_STAGE2_VIRT_NONE;
+	if (map_start >= state->start && map_end <= state->end)
+		return KVM_RISCV_STAGE2_VIRT_FULL;
+	return KVM_RISCV_STAGE2_VIRT_PARTIAL;
+}
 
 int kvm_riscv_mmu_map(struct kvm_vcpu *vcpu, struct kvm_memory_slot *memslot,
 		      gpa_t gpa, unsigned long hva, bool is_write,
@@ -331,7 +363,7 @@ int kvm_riscv_mmu_map(struct kvm_vcpu *vcpu, struct kvm_memory_slot *memslot,
 	kvm_pfn_t hfn;
 	bool writable;
 	short vma_pageshift;
-	gfn_t gfn = gpa >> PAGE_SHIFT;
+	gfn_t gfn;
 	struct vm_area_struct *vma;
 	struct kvm *kvm = vcpu->kvm;
 	struct kvm_mmu_memory_cache *pcache = &vcpu->arch.mmu_page_cache;
@@ -340,14 +372,15 @@ int kvm_riscv_mmu_map(struct kvm_vcpu *vcpu, struct kvm_memory_slot *memslot,
 	unsigned long vma_pagesize, mmu_seq;
 	struct kvm_gstage gstage;
 	struct page *page;
+	struct kvm_riscv_stage2_virt_state stage2_state;
+	enum kvm_riscv_stage2_virt_match stage2_match;
+	gpa_t map_gpa;
+	bool stage2_virt;
 
 	gstage.kvm = kvm;
 	gstage.flags = 0;
 	gstage.vmid = READ_ONCE(kvm->arch.vmid.vmid);
 	gstage.pgd = kvm->arch.pgd;
-
-	/* Setup initial state of output mapping */
-	memset(out_map, 0, sizeof(*out_map));
 
 	/* We need minimum second+third level pages */
 	ret = kvm_mmu_topup_memory_cache(pcache, kvm_riscv_gstage_pgd_levels);
@@ -355,6 +388,10 @@ int kvm_riscv_mmu_map(struct kvm_vcpu *vcpu, struct kvm_memory_slot *memslot,
 		kvm_err("Failed to topup G-stage cache\n");
 		return ret;
 	}
+
+retry:
+	/* Setup initial state of output mapping */
+	memset(out_map, 0, sizeof(*out_map));
 
 	mmap_read_lock(current->mm);
 
@@ -373,9 +410,6 @@ int kvm_riscv_mmu_map(struct kvm_vcpu *vcpu, struct kvm_memory_slot *memslot,
 	if (logging || (vma->vm_flags & VM_PFNMAP))
 		vma_pagesize = PAGE_SIZE;
 
-	if (vma_pagesize == PMD_SIZE || vma_pagesize == PUD_SIZE)
-		gfn = (gpa & huge_page_mask(hstate_vma(vma))) >> PAGE_SHIFT;
-
 	/*
 	 * Read mmu_invalidate_seq so that KVM can detect if the results of
 	 * vma_lookup() or __kvm_faultin_pfn() become stale prior to acquiring
@@ -393,6 +427,34 @@ int kvm_riscv_mmu_map(struct kvm_vcpu *vcpu, struct kvm_memory_slot *memslot,
 		kvm_err("Invalid VMA page size 0x%lx\n", vma_pagesize);
 		return -EFAULT;
 	}
+
+	/*
+	 * Snapshot the Stage2Virt range before faulting in the backing page.
+	 * The snapshot is checked again under mmu_lock before installing the
+	 * G-stage PTE.
+	 */
+	spin_lock(&kvm->mmu_lock);
+	stage2_state = kvm->arch.stage2_virt;
+	spin_unlock(&kvm->mmu_lock);
+
+	map_gpa = gpa & ~(vma_pagesize - 1);
+	stage2_match = kvm_riscv_stage2_virt_match(&stage2_state,
+						   map_gpa, vma_pagesize);
+
+	/* A partially covered large mapping must be rebuilt at base-page size. */
+	if (stage2_match == KVM_RISCV_STAGE2_VIRT_PARTIAL) {
+		vma_pagesize = PAGE_SIZE;
+		map_gpa = gpa & PAGE_MASK;
+		stage2_match = kvm_riscv_stage2_virt_match(&stage2_state,
+							   map_gpa,
+							   PAGE_SIZE);
+	}
+
+	stage2_virt = stage2_match == KVM_RISCV_STAGE2_VIRT_FULL;
+	if (stage2_virt && logging)
+		return -EOPNOTSUPP;
+
+	gfn = map_gpa >> PAGE_SHIFT;
 
 	hfn = __kvm_faultin_pfn(memslot, gfn, is_write ? FOLL_WRITE : 0,
 				&writable, &page);
@@ -416,13 +478,25 @@ int kvm_riscv_mmu_map(struct kvm_vcpu *vcpu, struct kvm_memory_slot *memslot,
 	if (mmu_invalidate_retry(kvm, mmu_seq))
 		goto out_unlock;
 
+	/* Retry if an ioctl changed the Stage2Virt range while faulting in. */
+	if (stage2_state.enabled != kvm->arch.stage2_virt.enabled ||
+	    stage2_state.start != kvm->arch.stage2_virt.start ||
+	    stage2_state.end != kvm->arch.stage2_virt.end) {
+		kvm_release_faultin_page(kvm, page, true, false);
+		spin_unlock(&kvm->mmu_lock);
+		cond_resched();
+		goto retry;
+	}
+
 	if (writable) {
 		mark_page_dirty_in_slot(kvm, memslot, gfn);
-		ret = kvm_riscv_gstage_map_page(&gstage, pcache, gpa, hfn << PAGE_SHIFT,
-						vma_pagesize, false, true, out_map);
+		ret = kvm_riscv_gstage_map_page(&gstage, pcache, map_gpa,
+						hfn << PAGE_SHIFT, vma_pagesize,
+						false, true, stage2_virt, out_map);
 	} else {
-		ret = kvm_riscv_gstage_map_page(&gstage, pcache, gpa, hfn << PAGE_SHIFT,
-						vma_pagesize, true, true, out_map);
+		ret = kvm_riscv_gstage_map_page(&gstage, pcache, map_gpa,
+						hfn << PAGE_SHIFT, vma_pagesize,
+						true, true, stage2_virt, out_map);
 	}
 
 	if (ret)

@@ -167,6 +167,7 @@ int kvm_riscv_gstage_map_page(struct kvm_gstage *gstage,
 			      struct kvm_mmu_memory_cache *pcache,
 			      gpa_t gpa, phys_addr_t hpa, unsigned long page_size,
 			      bool page_rdonly, bool page_exec,
+				  bool stage2_virt,
 			      struct kvm_gstage_mapping *out_map)
 {
 	pgprot_t prot;
@@ -192,7 +193,9 @@ int kvm_riscv_gstage_map_page(struct kvm_gstage *gstage,
 	 * dirty pages.
 	 */
 
-	if (page_exec) {
+	if (stage2_virt) {
+		prot = PAGE_READ;
+	} else if (page_exec) {
 		if (page_rdonly)
 			prot = PAGE_READ_EXEC;
 		else
@@ -205,6 +208,8 @@ int kvm_riscv_gstage_map_page(struct kvm_gstage *gstage,
 	}
 	out_map->pte = pfn_pte(PFN_DOWN(hpa), prot);
 	out_map->pte = pte_mkdirty(out_map->pte);
+	if (stage2_virt)
+		out_map->pte = gstage_pte_mkstage2_virt(out_map->pte);
 
 	return kvm_riscv_gstage_set_pte(gstage, pcache, out_map);
 }
@@ -282,6 +287,35 @@ next:
 		 * to prevent starvation and lockup detector warnings.
 		 */
 		if (!(gstage->flags & KVM_GSTAGE_FLAGS_LOCAL) && may_block && addr < end)
+			cond_resched_lock(&gstage->kvm->mmu_lock);
+	}
+}
+
+void kvm_riscv_gstage_zap_range(struct kvm_gstage *gstage,
+					gpa_t start, gpa_t size, bool may_block)
+{
+	pte_t *ptep;
+	u32 ptep_level;
+	bool found_leaf;
+	unsigned long page_size;
+	gpa_t addr = start;
+	gpa_t end = start + size;
+	gpa_t leaf_addr;
+	int ret;
+	while (addr < end) {
+		// 查找当前 GPA 对应的叶 PTE
+		found_leaf = kvm_riscv_gstage_get_leaf(gstage, addr,
+							&ptep, &ptep_level);
+		// 计算叶 PTE 覆盖范围
+		ret = gstage_level_to_page_size(ptep_level, &page_size);
+		if (ret) break;
+		leaf_addr = addr & ~(page_size - 1);		// 起点
+		if (found_leaf)				// 清除 PTE
+			kvm_riscv_gstage_op_pte(gstage, leaf_addr, ptep,
+						ptep_level, GSTAGE_OP_CLEAR);
+		addr = leaf_addr + page_size;
+		if (!(gstage->flags & KVM_GSTAGE_FLAGS_LOCAL) &&
+			may_block && addr < end)
 			cond_resched_lock(&gstage->kvm->mmu_lock);
 	}
 }

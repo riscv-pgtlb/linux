@@ -170,6 +170,100 @@ bool kvm_arch_irqchip_in_kernel(struct kvm *kvm)
 {
 	return irqchip_in_kernel(kvm);
 }
+static void kvm_riscv_stage2_virt_zap_locked(struct kvm *kvm,
+					      gpa_t start, gpa_t end)
+{
+	struct kvm_gstage gstage = {
+		.kvm = kvm,
+		.flags = 0,
+		.vmid = READ_ONCE(kvm->arch.vmid.vmid),
+		.pgd = kvm->arch.pgd,
+	};
+	lockdep_assert_held(&kvm->mmu_lock);
+	if (start >= end)
+		return;
+	kvm_riscv_gstage_zap_range(&gstage, start, end - start, true);
+}
+
+static bool kvm_riscv_stage2_virt_has_dirty_log(struct kvm *kvm,
+						 gpa_t start, gpa_t end)
+{
+	struct kvm_memslots *slots;
+	struct kvm_memory_slot *slot;
+	gpa_t slot_start, slot_end;
+	int bkt;
+
+	lockdep_assert_held(&kvm->slots_lock);
+
+	slots = kvm_memslots(kvm);
+	kvm_for_each_memslot(slot, bkt, slots) {
+		if (!(slot->flags & KVM_MEM_LOG_DIRTY_PAGES))
+			continue;
+
+		slot_start = slot->base_gfn << PAGE_SHIFT;
+		slot_end = (slot->base_gfn + slot->npages) << PAGE_SHIFT;
+		if (start < slot_end && slot_start < end)
+			return true;
+	}
+
+	return false;
+}
+
+static int kvm_riscv_set_stage2_virt(struct kvm *kvm, void __user *argp)
+{
+	struct kvm_riscv_stage2_virt request;
+	gpa_t old_start, old_end;
+	gpa_t start = 0, end = 0;
+	bool old_enabled;
+	bool enable;
+	int ret = 0;
+	if (copy_from_user(&request, argp, sizeof(request)))
+		return -EFAULT;
+	if (memchr_inv(request.reserved, 0, sizeof(request.reserved)))
+		return -EINVAL;
+	if (request.flags & ~KVM_RISCV_STAGE2_VIRT_ENABLE)
+		return -EINVAL;
+	enable = request.flags & KVM_RISCV_STAGE2_VIRT_ENABLE;
+	if (!enable) {
+		if (request.guest_phys_addr || request.memory_size)
+			return -EINVAL;
+	} else {
+		if (!request.memory_size)
+			return -EINVAL;
+		start = request.guest_phys_addr;
+		if (!PAGE_ALIGNED(start) || !PAGE_ALIGNED(request.memory_size))
+			return -EINVAL;
+		if (start >= kvm_riscv_gstage_gpa_size)
+			return -EINVAL;
+		if (request.memory_size > kvm_riscv_gstage_gpa_size - start)
+			return -EINVAL;
+		end = start + request.memory_size;
+	}
+
+	mutex_lock(&kvm->slots_lock);
+	if (enable &&
+	    kvm_riscv_stage2_virt_has_dirty_log(kvm, start, end)) {
+		ret = -EBUSY;
+		goto out_unlock_slots;
+	}
+
+	spin_lock(&kvm->mmu_lock);
+	old_start = kvm->arch.stage2_virt.start;
+	old_end = kvm->arch.stage2_virt.end;
+	old_enabled = kvm->arch.stage2_virt.enabled;
+	kvm->arch.stage2_virt.start = start;
+	kvm->arch.stage2_virt.end = end;
+	kvm->arch.stage2_virt.enabled = enable;
+	if (old_enabled)
+		kvm_riscv_stage2_virt_zap_locked(kvm, old_start, old_end);
+	if (enable && (!old_enabled || start != old_start || end != old_end))
+		kvm_riscv_stage2_virt_zap_locked(kvm, start, end);
+	spin_unlock(&kvm->mmu_lock);
+
+out_unlock_slots:
+	mutex_unlock(&kvm->slots_lock);
+	return ret;
+}
 
 int kvm_vm_ioctl_check_extension(struct kvm *kvm, long ext)
 {
@@ -202,6 +296,9 @@ int kvm_vm_ioctl_check_extension(struct kvm *kvm, long ext)
 	case KVM_CAP_VM_GPA_BITS:
 		r = kvm_riscv_gstage_gpa_bits;
 		break;
+	case KVM_CAP_RISCV_STAGE2_VIRT:
+		r = 1;
+		break;
 	default:
 		r = 0;
 		break;
@@ -225,5 +322,11 @@ int kvm_vm_ioctl_enable_cap(struct kvm *kvm, struct kvm_enable_cap *cap)
 
 int kvm_arch_vm_ioctl(struct file *filp, unsigned int ioctl, unsigned long arg)
 {
-	return -EINVAL;
+	struct kvm *kvm = filp->private_data;
+	switch (ioctl) {
+	case KVM_RISCV_SET_STAGE2_VIRT:
+		return kvm_riscv_set_stage2_virt(kvm, (void __user *)arg);
+	default:
+		return -EINVAL;
+	}
 }
