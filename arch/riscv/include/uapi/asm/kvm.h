@@ -75,8 +75,8 @@ struct kvm_riscv_core {
 #define KVM_RISCV_STAGE2_VIRT_ENABLE	(1ULL << 0)
 
 struct kvm_riscv_stage2_virt {
-	__u64 guest_phys_addr;		// GPA 起点
-	__u64 memory_size;			// 范围长度、按页对齐
+	__u64 guest_phys_addr;
+	__u64 memory_size;
 	__u64 flags;
 	__u64 reserved[5];
 };
