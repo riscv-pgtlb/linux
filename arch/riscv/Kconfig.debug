@@ -10,3 +10,18 @@ config RISCV_PMP_VIRT_GUEST_TEST
 	  Requires the paired experimental host /dev/pvtest ioctl. Executes
 	  fixed instructions before and after a synchronous host HS probe.
 	  Say N for normal use.
+
+config RISCV_STAGE2_VIRT_GUEST_TEST
+	bool "Stage2Virt guest VU/VS same-page test"
+	depends on 64BIT && MMU && RISCV_SBI && MISC_DEVICES
+	default n
+	help
+	  Build the experimental Stage2Virt Guest test device.
+
+	  The device allocates one page, maps it into VU userspace and
+	  performs a controlled VS write to the same guest physical page.
+
+	  Activate it with stage2virt_guest_test=1 under
+	  lkvm --stage2-virt-test with one vCPU.
+
+	  Say N for normal use.
