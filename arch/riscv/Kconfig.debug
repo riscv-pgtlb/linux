@@ -13,7 +13,7 @@ config RISCV_PMP_VIRT_GUEST_TEST
 
 config RISCV_STAGE2_VIRT_GUEST_TEST
 	bool "Stage2Virt guest VU/VS same-page test"
-	depends on 64BIT && MMU && RISCV_SBI && MISC_DEVICES
+	depends on 64BIT && MMU && RISCV_SBI
 	default n
 	help
 	  Build the experimental Stage2Virt Guest test device.
