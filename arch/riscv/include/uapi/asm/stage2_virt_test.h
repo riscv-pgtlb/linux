@@ -15,6 +15,14 @@ struct stage2_virt_test_value {
 	__u8 reserved[7];
 };
 
+struct stage2_virt_attack_result {
+	__u64 version;
+	__u64 count;
+	__u64 cause;
+	__u64 before;
+	__u64 after;
+};
+
 #define STAGE2_VIRT_TEST_IOC_MAGIC	'G'
 
 #define STAGE2_VIRT_TEST_IOC_GET_INFO				\
@@ -30,5 +38,8 @@ struct stage2_virt_test_value {
 	     struct stage2_virt_test_value)
 #define STAGE2_VIRT_TEST_IOC_ABORT				\
 	_IO(STAGE2_VIRT_TEST_IOC_MAGIC, 0x04)
+#define STAGE2_VIRT_TEST_IOC_ATTACK_PROBE			\
+	_IOR(STAGE2_VIRT_TEST_IOC_MAGIC, 0x05,			\
+	     struct stage2_virt_attack_result)
 
 #endif

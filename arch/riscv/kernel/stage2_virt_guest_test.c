@@ -133,6 +133,61 @@ static int stage2_virt_vs_probe(u8 expected)
 	return 0;
 }
 
+static long stage2_virt_attack_probe(unsigned long argument)
+{
+	struct stage2_virt_attack_result result = {
+		.version = 1,
+		.count = 1,
+		.cause = 15, /* VS store guest-page fault. */
+		.before = 0x5a,
+		.after = 0x5a,
+	};
+	phys_addr_t gpa = page_to_phys(test_page);
+	u8 *address = page_address(test_page);
+	int ret;
+
+	if (!capable(CAP_SYS_ADMIN))
+		return -EPERM;
+	if (!argument || !access_ok((void __user *)argument, sizeof(result)))
+		return -EFAULT;
+
+	mutex_lock(&test_lock);
+	if (session_active) {
+		ret = -EBUSY;
+		goto out_unlock;
+	}
+
+	clear_highpage(test_page);
+	WRITE_ONCE(*address, (u8)result.before);
+	ret = stage2_virt_sbi_call(STAGE2_VIRT_SBI_BEGIN, gpa, PAGE_SIZE);
+	if (ret)
+		goto out_unlock;
+	session_active = true;
+
+	ret = stage2_virt_vs_probe((u8)result.before);
+	result.after = READ_ONCE(*address);
+	if (!ret && result.after != result.before)
+		ret = -EIO;
+
+	{
+		int complete_ret = stage2_virt_sbi_call(STAGE2_VIRT_SBI_COMPLETE,
+						      gpa, PAGE_SIZE);
+		session_active = false;
+		if (!ret)
+			ret = complete_ret;
+	}
+	if (!ret && copy_to_user((void __user *)argument, &result,
+				 sizeof(result)))
+		ret = -EFAULT;
+	if (!ret)
+		pr_info("Stage2Virt syscall attack PASS: GPA=%pa cause=%llu bytes=unchanged\n",
+			&gpa, result.cause);
+
+out_unlock:
+	mutex_unlock(&test_lock);
+	return ret;
+}
+
 static long stage2_virt_test_ioctl(struct file *file,
 				   unsigned int command,
 				   unsigned long argument)
@@ -227,6 +282,9 @@ static long stage2_virt_test_ioctl(struct file *file,
 		mutex_lock(&test_lock);
 		ret = stage2_virt_abort_locked();
 		goto out_unlock;
+
+	case STAGE2_VIRT_TEST_IOC_ATTACK_PROBE:
+		return stage2_virt_attack_probe(argument);
 
 	default:
 		return -ENOTTY;
